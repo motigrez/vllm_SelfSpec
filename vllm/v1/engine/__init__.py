@@ -70,6 +70,8 @@ class EngineCoreRequest(
 
     trace_headers: Optional[Mapping[str, str]] = None
 
+    prompt_group_id: Optional[int] = None                    # modified here
+
 
 class EngineCoreEventType(enum.IntEnum):
     """The type of engine core request event."""
