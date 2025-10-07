@@ -177,6 +177,67 @@ class Scheduler(SchedulerInterface):
         )
         self.use_pp = self.parallel_config.pipeline_parallel_size > 1
 
+    def compute_preempt_score(self, req: Request) -> float:                 # modified here
+        """Score used to determine which request should be preempted.
+
+        Higher scores indicate better preemption candidates.
+        Policy: protect the longest (rank=0), prefer preempting the 2nd longest (rank=1).
+        """
+        prompt_group_id = getattr(req, "prompt_group_id", None)
+        if prompt_group_id is None:
+            exit("Error: prompt_group_id is not set for the request.")
+
+        # Collect all running requests belonging to the same prompt group.
+        group_reqs = [
+            running_req for running_req in self.running
+            if (getattr(running_req, "prompt_group_id") == prompt_group_id)
+        ]
+
+        # Rank by progress: more computed tokens first (rank=0 is the longest).
+        group_reqs_sorted = sorted(
+            group_reqs,
+            key=lambda running_req: running_req.num_computed_tokens,
+            reverse=True,
+        )
+        rank = next(
+            (idx for idx, running_req in enumerate(group_reqs_sorted)
+            if running_req.request_id == req.request_id),
+            len(group_reqs_sorted),
+        )
+
+        # Aggregate current group sizes to approximate average concurrency per prompt.
+        group_counts: dict[str, int] = {}
+        for running_req in self.running:
+            gid = getattr(running_req, "prompt_group_id", None)
+            if gid is None:
+                exit("Error: prompt_group_id is not set for the request.")
+            group_counts[gid] = group_counts.get(gid, 0) + 1
+        avg_group_size = (
+            sum(group_counts.values()) / len(group_counts)
+            if group_counts else 1.0
+        )
+
+        # ----- New rank policy -----
+        # Make rank=1 (2nd longest) the strongest preemption candidate,
+        # strongly protect rank=0 (longest), gently de-prioritize others.
+        BIG = 50
+        if len(group_reqs_sorted) < 2:
+            # No "second longest" exists -> avoid preempting singletons.
+            rank_term = -BIG
+        elif rank == 0:
+            rank_term = -BIG          # protect the longest
+        elif rank == 1:
+            rank_term = +BIG          # prefer preempting the 2nd longest
+        else:
+            rank_term = -float(rank)  # mild penalty for others (larger rank -> lower score)
+
+        beta = 0.5
+        size_term = beta * (len(group_reqs) / avg_group_size)
+
+        score = rank_term + size_term
+        return score
+
+
     def schedule(self) -> SchedulerOutput:
         # NOTE(woosuk) on the scheduling algorithm:
         # There's no "decoding phase" nor "prefill phase" in the scheduler.
@@ -265,11 +326,16 @@ class Scheduler(SchedulerInterface):
 
                 # The request cannot be scheduled.
                 # Preempt the lowest-priority request.
-                if self.policy == SchedulingPolicy.PRIORITY:
-                    preempted_req = max(
-                        self.running,
-                        key=lambda r: (r.priority, r.arrival_time),
-                    )
+                if self.policy == SchedulingPolicy.PRIORITY:                # modified here
+                    if getattr(self.running[0], 'prompt_group_id', 0) != 0:
+                        preempted_req = max(self.running,
+                                        key=self.compute_preempt_score)
+                    else:
+                        preempted_req = max(
+                            self.running,
+                            key=lambda r: (r.priority, r.arrival_time),
+                        )
+
                     self.running.remove(preempted_req)
                     if preempted_req in scheduled_running_reqs:
                         scheduled_running_reqs.remove(preempted_req)
