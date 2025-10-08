@@ -607,6 +607,7 @@ class InputBatch:
             # The batched states are empty.
             self._req_ids.clear()
             self.req_output_token_ids.clear()
+            self.prompt_group_ids.clear()          # modified here
             return
 
         # NOTE(woosuk): This function assumes that the empty_req_indices
@@ -701,6 +702,7 @@ class InputBatch:
         # Trim lists to the batch size.
         del self._req_ids[num_reqs:]
         del self.req_output_token_ids[num_reqs:]
+        del self.prompt_group_ids[num_reqs:]
 
     def refresh_metadata(self):
         """Apply any batch updates to sampling metadata."""
