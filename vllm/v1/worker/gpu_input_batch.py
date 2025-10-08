@@ -44,6 +44,7 @@ class CachedRequestState:
 
     lora_request: Optional[LoRARequest] = None
     prompt_embeds: Optional[torch.Tensor] = None
+    prompt_group_id: Optional[int] = None          # modified here
 
     def __post_init__(self):
         self.num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
@@ -280,6 +281,8 @@ class InputBatch:
         self.prev_sampled_token_ids_invalid_indices: Optional[set[int]] = None
         self.prev_req_id_to_index: Optional[dict[str, int]] = None
 
+        self.prompt_group_ids: list[Optional[int]] = []              # modified here
+
     @property
     def req_ids(self) -> list[str]:
         # None elements should only be present transiently
@@ -314,12 +317,15 @@ class InputBatch:
         req_index = self._register_add_request(request)
 
         req_id = request.req_id
+        prompt_group_id = getattr(request, "prompt_group_id", None)
         if req_index == len(self._req_ids):
             self._req_ids.append(req_id)
             self.req_output_token_ids.append(request.output_token_ids)
+            self.prompt_group_ids.append(prompt_group_id)          # modified here
         else:
             self._req_ids[req_index] = req_id
             self.req_output_token_ids[req_index] = request.output_token_ids
+            self.prompt_group_ids[req_index] = prompt_group_id          # modified here
 
         self.req_id_to_index[req_id] = req_index
 
@@ -462,6 +468,7 @@ class InputBatch:
         self.batch_update_builder.removed_append(req_index)
         self._req_ids[req_index] = None
         self.req_output_token_ids[req_index] = None
+        self.prompt_group_ids[req_index] = None          # modified here
 
         # LoRA
         lora_id = self.request_lora_mapping[req_index]
@@ -502,6 +509,9 @@ class InputBatch:
         old_id_i2 = self._req_ids[i2]
         self._req_ids[i1], self._req_ids[i2] =\
             self._req_ids[i2], self._req_ids[i1] # noqa
+        self.prompt_group_ids[i1], self.prompt_group_ids[i2] = (
+            self.prompt_group_ids[i2], self.prompt_group_ids[i1]
+        )       # modified here
         self.req_output_token_ids[i1], self.req_output_token_ids[i2] =\
             self.req_output_token_ids[i2], self.req_output_token_ids[i1]
         assert old_id_i1 is not None and old_id_i2 is not None
@@ -624,6 +634,8 @@ class InputBatch:
             self.req_output_token_ids[empty_index] = output_token_ids
             self.req_output_token_ids[last_req_index] = None
             self.req_id_to_index[req_id] = empty_index
+            self.prompt_group_ids[empty_index] = self.prompt_group_ids[last_req_index]
+            self.prompt_group_ids[last_req_index] = None      # modified here
 
             num_tokens = self.num_tokens[last_req_index]
             self.token_ids_cpu[empty_index, :num_tokens] = self.token_ids_cpu[

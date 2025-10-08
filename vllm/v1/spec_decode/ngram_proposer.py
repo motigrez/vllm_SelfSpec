@@ -57,7 +57,7 @@ class NgramProposer:
         # This usually takes less than 1 second.
         self.propose([[]] * 1024, [""] * 1024, np.zeros(1024, dtype=np.int32),
                      np.zeros((1024, self.max_model_len), dtype=np.int32),
-                     set())
+                     set(), [])
 
     def batch_propose(
         self,
@@ -65,6 +65,7 @@ class NgramProposer:
         valid_ngram_requests: list,
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
+        prompt_group_ids: list[int],
     ) -> list[list[int]]:
         """Batch version of ngram proposer using numba for acceleration.
         
@@ -102,11 +103,23 @@ class NgramProposer:
             else:
                 set_num_threads(1)
 
+            if not prompt_group_ids:
+                longest_index_per_group = []
+            else:
+                max_num_groups = max(prompt_group_ids) + 1                        # prompt_group_id starts from 1
+                longest_index_per_group = [-1 for _ in range(max_num_groups)]
+                for i in valid_ngram_requests:                                         # modified here
+                    gid = prompt_group_ids[i]
+                    if longest_index_per_group[gid] == -1 or num_tokens_no_spec[i] > num_tokens_no_spec[longest_index_per_group[gid]]:
+                        longest_index_per_group[gid] = i
+
             batch_propose_numba(valid_ngram_requests, num_tokens_no_spec,
                                 token_ids_cpu, self.min_n, self.max_n,
                                 self.max_model_len, self.k,
                                 self.valid_ngram_draft,
-                                self.valid_ngram_num_drafts)
+                                self.valid_ngram_num_drafts,
+                                prompt_group_ids,
+                                longest_index_per_group)
 
             # Restore original number of threads.
             set_num_threads(original_num_numba_threads)
@@ -128,6 +141,7 @@ class NgramProposer:
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
         spec_decode_unsupported_reqs: set,
+        prompt_group_ids: list[int],
     ) -> list[list[int]]:
 
         # find which requests need ngram proposals
@@ -156,6 +170,7 @@ class NgramProposer:
             valid_ngram_requests,
             num_tokens_no_spec,
             token_ids_cpu,
+            prompt_group_ids,
         )
 
         return draft_token_ids
@@ -171,11 +186,34 @@ def batch_propose_numba(valid_ngram_requests: list,
                         token_ids_cpu: np.ndarray, min_n: int, max_n: int,
                         max_model_len: int, k: int,
                         valid_ngram_draft: np.ndarray,
-                        valid_ngram_num_drafts: np.ndarray):
+                        valid_ngram_num_drafts: np.ndarray,
+                        prompt_group_ids: list,
+                        longest_index_per_group: list):
+    
     for i in prange(len(valid_ngram_requests)):
-        idx = valid_ngram_requests[i]
-        num_tokens = num_tokens_no_spec[idx]
-        context_token_ids = token_ids_cpu[idx, :num_tokens]
+        if not prompt_group_ids:
+            idx = valid_ngram_requests[i]
+            num_tokens = num_tokens_no_spec[idx]
+            context_token_ids = token_ids_cpu[idx, :num_tokens]
+        else:
+            idx = valid_ngram_requests[i]
+            q_len = num_tokens_no_spec[idx]
+
+            gid = prompt_group_ids[idx]
+            s_idx = longest_index_per_group[gid]  # modified here
+            s_len = num_tokens_no_spec[s_idx]
+
+            query_tokens  = token_ids_cpu[idx,  :q_len]
+            source_tokens = token_ids_cpu[s_idx, :s_len]
+
+            if idx == s_idx:
+                context_token_ids = query_tokens
+            else:
+                total_len = s_len + q_len
+                context_token_ids = np.empty(total_len, dtype=np.int32)
+                context_token_ids[:s_len] = source_tokens
+                context_token_ids[s_len:] = query_tokens
+
         drafter_output = _find_longest_matched_ngram_and_propose_tokens(
             origin_tokens=context_token_ids,
             min_ngram=min_n,

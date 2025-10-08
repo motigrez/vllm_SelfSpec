@@ -617,6 +617,7 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 num_computed_tokens=new_req_data.num_computed_tokens,
                 output_token_ids=[],
                 lora_request=new_req_data.lora_request,
+                prompt_group_id=new_req_data.prompt_group_id,
             )
             self.requests[req_id] = req_state
 
@@ -2576,7 +2577,8 @@ class GPUModelRunner(LoRAModelRunnerMixin, KVConnectorModelRunnerMixin):
                 sampled_token_ids, self.input_batch.req_ids,
                 self.input_batch.num_tokens_no_spec,
                 self.input_batch.token_ids_cpu,
-                self.input_batch.spec_decode_unsupported_reqs)
+                self.input_batch.spec_decode_unsupported_reqs,
+                self.input_batch.prompt_group_ids)
         elif self.speculative_config.method == "medusa":
             assert isinstance(sampled_token_ids, list)
             assert isinstance(self.drafter, MedusaProposer)
