@@ -221,6 +221,8 @@ class EngineCore:
         `request_wave`: indicate which wave of requests this is expected to
         belong to in DP case
         """
+        if request.prompt_group_id != 0:
+            logger.info("Prompt Group ID Trace: vllm/v1/engine/core.py EngineCore.add_request()")
         # Validate the request_id type.
         if not isinstance(request.request_id, str):
             raise TypeError(

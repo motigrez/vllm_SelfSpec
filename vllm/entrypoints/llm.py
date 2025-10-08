@@ -341,7 +341,7 @@ class LLM:
         use_tqdm: Union[bool, Callable[..., tqdm]] = True,
         lora_request: Optional[Union[list[LoRARequest], LoRARequest]] = None,
         priority: Optional[list[int]] = None,
-        prompt_group_ids: Optional[list[int]] = None,
+        prompt_group_ids: Optional[list[int]] = None,             # modified here
     ) -> list[RequestOutput]:
         """Generates the completions for the input prompts.
 
@@ -390,6 +390,8 @@ class LLM:
         # Add any modality specific loras to the corresponding prompts
         lora_request = self._get_modality_specific_lora_reqs(
             prompts, lora_request)
+    
+        logger.info("Prompt Group ID Trace: LLM.generate()")
 
         self._validate_and_add_requests(
             prompts=prompts,
@@ -1502,6 +1504,8 @@ class LLM:
 
         model_config = self.llm_engine.model_config
 
+        logger.info("Prompt Group ID Trace: LLM._validate_and_add_requests()")
+
         for i, prompt in enumerate(it):
 
             if isinstance(prompt, dict):
@@ -1571,6 +1575,7 @@ class LLM:
         prompt_group_id: int = 0,
     ) -> None:
         request_id = str(next(self.request_counter))
+        logger.info("Prompt Group ID Trace: LLM._add_request()")
         self.llm_engine.add_request(
             request_id,
             prompt,

@@ -234,6 +234,7 @@ class LLMEngine:
 
         n = params.n if isinstance(params, SamplingParams) else 1
 
+        logger.info("Prompt Group ID Trace: vllm/v1/engine/llm_engine.py LLMEngine.add_request()")
         if n == 1:
             # Make a new RequestState and queue.
             self.output_processor.add_request(request, prompt_str, None, 0)
