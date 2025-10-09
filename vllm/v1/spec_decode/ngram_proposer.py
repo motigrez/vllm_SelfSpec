@@ -7,6 +7,8 @@ from numba import get_num_threads, jit, njit, prange, set_num_threads
 
 from vllm.config import VllmConfig
 
+from vllm.logger import init_logger
+logger = init_logger(__name__)
 
 class NgramProposer:
 
@@ -31,6 +33,9 @@ class NgramProposer:
         self.valid_ngram_draft = np.zeros((max_num_seqs, self.k),
                                           dtype=np.int32)
         self.valid_ngram_num_drafts = np.zeros((max_num_seqs), dtype=np.int32)
+        # Track the longest context observed per prompt group.
+        self.group_longest_sequences: dict[int,
+                                           tuple[str, np.ndarray]] = {}
 
         # Threshold of total number of tokens in the batch to enable
         # multi-threading in numba batch propose.
@@ -59,6 +64,96 @@ class NgramProposer:
                      np.zeros((1024, self.max_model_len), dtype=np.int32),
                      set(), [])
 
+    def _update_group_longest_sequences(self, req_ids: list[str],
+                                        prompt_group_ids: list[int],
+                                        num_tokens_no_spec: np.ndarray,
+                                        token_ids_cpu: np.ndarray) -> None:
+        for idx, gid in enumerate(prompt_group_ids):
+            if gid is None:
+                continue
+            seq_len = int(num_tokens_no_spec[idx])
+            if seq_len <= 0:
+                continue
+            tokens = token_ids_cpu[idx, :seq_len]
+            cached = self.group_longest_sequences.get(gid)
+            if cached is None or seq_len > cached[1].shape[0]:
+                self.group_longest_sequences[gid] = (
+                    req_ids[idx], tokens.copy())
+
+    def _prepare_group_context_data(
+        self,
+        req_ids: list[str],
+        prompt_group_ids: list[int],
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        num_requests = len(prompt_group_ids)
+        group_slot_ids = np.full(num_requests, -1, dtype=np.int32)
+        should_concat = np.zeros(num_requests, dtype=np.bool_)
+        if not prompt_group_ids:
+            empty_int = np.empty(0, dtype=np.int32)
+            empty_bool = np.empty(0, dtype=np.bool_)
+            return (group_slot_ids, empty_int, empty_int, empty_int,
+                    empty_bool)
+
+        unique_group_ids: list[int] = []
+        seen_groups: set[int] = set()
+        for gid in prompt_group_ids:
+            if gid is None:   # ← new
+                continue
+            if gid in seen_groups:
+                continue
+            seen_groups.add(gid)
+            unique_group_ids.append(gid)
+
+        group_slot_map: dict[int, int] = {}
+        offsets: list[int] = []
+        lengths: list[int] = []
+        context_segments: list[np.ndarray] = []
+        total_length = 0
+        for slot, gid in enumerate(unique_group_ids):
+            group_slot_map[gid] = slot
+            entry = self.group_longest_sequences.get(gid)
+            tokens = (entry[1] if entry is not None else
+                      np.empty(0, dtype=np.int32))
+            tokens = np.asarray(tokens, dtype=np.int32)
+            offsets.append(total_length)
+            length = int(tokens.shape[0])
+            lengths.append(length)
+            if length > 0:
+                context_segments.append(tokens)
+            total_length += length
+
+        if total_length > 0 and context_segments:
+            group_context_tokens = np.empty(total_length, dtype=np.int32)
+            cursor = 0
+            for segment in context_segments:
+                seg_len = segment.shape[0]
+                if seg_len == 0:
+                    continue
+                group_context_tokens[cursor:cursor + seg_len] = segment
+                cursor += seg_len
+        else:
+            group_context_tokens = np.empty(0, dtype=np.int32)
+
+        group_context_offsets = (np.array(offsets, dtype=np.int32)
+                                 if offsets else np.empty(0, dtype=np.int32))
+        group_context_lengths = (np.array(lengths, dtype=np.int32)
+                                 if lengths else np.empty(0, dtype=np.int32))
+
+        for idx, gid in enumerate(prompt_group_ids):
+            slot = group_slot_map.get(gid, -1)
+            group_slot_ids[idx] = slot
+            if slot == -1:
+                continue
+            entry = self.group_longest_sequences.get(gid)
+            if entry is None:
+                continue
+            owner_req_id, tokens = entry
+            if tokens.shape[0] > 0 and owner_req_id != req_ids[idx]:
+                should_concat[idx] = True
+
+        return (group_slot_ids, group_context_tokens, group_context_offsets,
+                group_context_lengths, should_concat)
+
     def batch_propose(
         self,
         num_requests: int,
@@ -66,6 +161,7 @@ class NgramProposer:
         num_tokens_no_spec: np.ndarray,
         token_ids_cpu: np.ndarray,
         prompt_group_ids: list[int],
+        req_ids: list[str],
     ) -> list[list[int]]:
         """Batch version of ngram proposer using numba for acceleration.
         
@@ -78,6 +174,8 @@ class NgramProposer:
             token_ids_cpu: 
                 Numpy array of shape (batch_size, max_model_len) 
                 representing the token IDs for each request.
+            req_ids:
+                List of request identifiers aligned with the batch.
 
         Returns:
             list[list[int]]: 
@@ -103,15 +201,20 @@ class NgramProposer:
             else:
                 set_num_threads(1)
 
-            if not prompt_group_ids:
-                longest_index_per_group = []
+            for req_idx in valid_ngram_requests:
+                self.valid_ngram_num_drafts[req_idx] = 0
+
+            if prompt_group_ids:
+                (group_slot_ids, group_context_tokens, group_context_offsets,
+                 group_context_lengths,
+                 should_concat) = self._prepare_group_context_data(
+                     req_ids, prompt_group_ids)
             else:
-                max_num_groups = max(prompt_group_ids) + 1                        # prompt_group_id starts from 1
-                longest_index_per_group = [-1 for _ in range(max_num_groups)]
-                for i in valid_ngram_requests:                                         # modified here
-                    gid = prompt_group_ids[i]
-                    if longest_index_per_group[gid] == -1 or num_tokens_no_spec[i] > num_tokens_no_spec[longest_index_per_group[gid]]:
-                        longest_index_per_group[gid] = i
+                group_slot_ids = np.full(num_requests, -1, dtype=np.int32)
+                group_context_tokens = np.empty(0, dtype=np.int32)
+                group_context_offsets = np.empty(0, dtype=np.int32)
+                group_context_lengths = np.empty(0, dtype=np.int32)
+                should_concat = np.zeros(num_requests, dtype=np.bool_)
 
             batch_propose_numba(valid_ngram_requests, num_tokens_no_spec,
                                 token_ids_cpu, self.min_n, self.max_n,
@@ -119,7 +222,11 @@ class NgramProposer:
                                 self.valid_ngram_draft,
                                 self.valid_ngram_num_drafts,
                                 prompt_group_ids,
-                                longest_index_per_group)
+                                group_slot_ids,
+                                group_context_tokens,
+                                group_context_offsets,
+                                group_context_lengths,
+                                should_concat)
 
             # Restore original number of threads.
             set_num_threads(original_num_numba_threads)
@@ -143,6 +250,25 @@ class NgramProposer:
         spec_decode_unsupported_reqs: set,
         prompt_group_ids: list[int],
     ) -> list[list[int]]:
+
+        if prompt_group_ids:
+            assert len(prompt_group_ids) == len(req_ids)
+            self._update_group_longest_sequences(req_ids, prompt_group_ids,
+                                                 num_tokens_no_spec,
+                                                 token_ids_cpu)
+            # logger.info(f"Length of req_ids: {len(req_ids)}, prompt_group_ids: {len(prompt_group_ids)}")
+            # logger.info(f"Shape of num_tokens_no_spec: {num_tokens_no_spec.shape}, token_ids_cpu: {token_ids_cpu.shape}")
+            # exit()
+            # assert len(req_ids) == num_tokens_no_spec.shape[0]
+            # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+            # ngram_running_info = [
+            #     (req_ids[i], prompt_group_ids[i])
+            #     for i in range(len(req_ids))
+            # ]
+            # logger.info(f"[NgramProposer] Currently running {len(ngram_running_info)} requests:")
+            # for rid, gid in ngram_running_info:
+            #     logger.info(f"  - request_id={rid}, prompt_group_id={gid}")
+            # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
 
         # find which requests need ngram proposals
         valid_ngram_requests = []
@@ -171,6 +297,7 @@ class NgramProposer:
             num_tokens_no_spec,
             token_ids_cpu,
             prompt_group_ids,
+            req_ids,
         )
 
         return draft_token_ids
@@ -188,31 +315,33 @@ def batch_propose_numba(valid_ngram_requests: list,
                         valid_ngram_draft: np.ndarray,
                         valid_ngram_num_drafts: np.ndarray,
                         prompt_group_ids: list,
-                        longest_index_per_group: list):
-    
+                        group_slot_ids: np.ndarray,
+                        group_context_tokens: np.ndarray,
+                        group_context_offsets: np.ndarray,
+                        group_context_lengths: np.ndarray,
+                        should_concat: np.ndarray):
+
     for i in prange(len(valid_ngram_requests)):
-        if not prompt_group_ids:
-            idx = valid_ngram_requests[i]
-            num_tokens = num_tokens_no_spec[idx]
-            context_token_ids = token_ids_cpu[idx, :num_tokens]
-        else:
-            idx = valid_ngram_requests[i]
-            q_len = num_tokens_no_spec[idx]
+        idx = valid_ngram_requests[i]
+        num_tokens = num_tokens_no_spec[idx]
+        context_token_ids = token_ids_cpu[idx, :num_tokens]
 
-            gid = prompt_group_ids[idx]
-            s_idx = longest_index_per_group[gid]  # modified here
-            s_len = num_tokens_no_spec[s_idx]
-
-            query_tokens  = token_ids_cpu[idx,  :q_len]
-            source_tokens = token_ids_cpu[s_idx, :s_len]
-
-            if idx == s_idx:
-                context_token_ids = query_tokens
-            else:
-                total_len = s_len + q_len
-                context_token_ids = np.empty(total_len, dtype=np.int32)
-                context_token_ids[:s_len] = source_tokens
-                context_token_ids[s_len:] = query_tokens
+        if len(prompt_group_ids) > 0:
+            slot = group_slot_ids[idx]
+            if (slot >= 0 and slot < group_context_lengths.shape[0]):
+                base_len = group_context_lengths[slot]
+                if base_len > 0:
+                    offset = group_context_offsets[slot]
+                    source_tokens = group_context_tokens[offset:offset +
+                                                         base_len]
+                    if should_concat[idx]:
+                        total_len = base_len + num_tokens
+                        combined = np.empty(total_len, dtype=np.int32)
+                        combined[:base_len] = source_tokens
+                        combined[base_len:] = context_token_ids
+                        context_token_ids = combined
+                    else:
+                        context_token_ids = source_tokens
 
         drafter_output = _find_longest_matched_ngram_and_propose_tokens(
             origin_tokens=context_token_ids,
@@ -221,9 +350,9 @@ def batch_propose_numba(valid_ngram_requests: list,
             max_model_len=max_model_len,
             k=k)
 
-        valid_ngram_num_drafts[i] = drafter_output.shape[0]
+        valid_ngram_num_drafts[idx] = drafter_output.shape[0]
         if len(drafter_output):
-            valid_ngram_draft[i, :drafter_output.shape[0]] = drafter_output
+            valid_ngram_draft[idx, :drafter_output.shape[0]] = drafter_output
 
 
 @jit(nopython=True)

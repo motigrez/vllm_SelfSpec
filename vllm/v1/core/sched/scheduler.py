@@ -235,6 +235,8 @@ class Scheduler(SchedulerInterface):
         size_term = beta * (len(group_reqs) / avg_group_size)
 
         score = rank_term + size_term
+
+        # logger.info(f"Preemption score for request {req.request_id}: {score}. Prompt Group ID: {prompt_group_id}, Current length: {req.num_computed_tokens}")  # modified here
         return score
 
 
@@ -249,6 +251,9 @@ class Scheduler(SchedulerInterface):
         # num_tokens_with_spec. This is general enough to cover
         # chunked prefills, prefix caching, speculative decoding,
         # and the "jump decoding" optimization in the future.
+
+        # logger.info("Start scheduling...")                         # modified here
+        # logger.info(f"Scheduling policy: {str(self.policy)}")          # modified here
 
         scheduled_new_reqs: list[Request] = []
         scheduled_resumed_reqs: list[Request] = []
@@ -326,8 +331,11 @@ class Scheduler(SchedulerInterface):
 
                 # The request cannot be scheduled.
                 # Preempt the lowest-priority request.
+                # logger.info("Not enough KV cache, need to preempt a request.")
                 if self.policy == SchedulingPolicy.PRIORITY:                # modified here
+                    # logger.info("Preempting based on priority policy.")      # modified here
                     if getattr(self.running[0], 'prompt_group_id', 0) != 0:
+                        # logger.info(f"Prompt Group ID Trace: {getattr(self.running[0], 'prompt_group_id', 0)}")  # modified here
                         preempted_req = max(self.running,
                                         key=self.compute_preempt_score)
                     else:
@@ -335,7 +343,7 @@ class Scheduler(SchedulerInterface):
                             self.running,
                             key=lambda r: (r.priority, r.arrival_time),
                         )
-
+                    # logger.info(f"Preempted request: {preempted_req.request_id}. Prompt Group ID: {getattr(preempted_req, 'prompt_group_id', 0)}")  # modified here
                     self.running.remove(preempted_req)
                     if preempted_req in scheduled_running_reqs:
                         scheduled_running_reqs.remove(preempted_req)
@@ -692,6 +700,17 @@ class Scheduler(SchedulerInterface):
             batch = KVEventBatch(ts=time.time(), events=events)
             self.kv_event_publisher.publish(batch)
 
+        # >>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>
+        # Custom logger: record currently running request info
+        # running_info = [
+        #     (req.request_id, getattr(req, "prompt_group_id", 0))
+        #     for req in self.running
+        # ]
+        # logger.info(f"[Scheduler] Currently running {len(running_info)} requests:")
+        # for rid, gid in running_info:
+        #     logger.info(f"  - request_id={rid}, prompt_group_id={gid}")
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
         self._update_after_schedule(scheduler_output)
         return scheduler_output
 
@@ -981,7 +1000,13 @@ class Scheduler(SchedulerInterface):
                 scheduler_output.scheduled_spec_decode_tokens.get(req_id))
             if scheduled_spec_token_ids:
                 num_draft_tokens = len(scheduled_spec_token_ids)
-                num_accepted = len(generated_token_ids) - 1
+                num_generated_tokens = len(generated_token_ids)
+                if num_generated_tokens == 0:
+                    num_accepted = 0
+                else:
+                    num_accepted = num_generated_tokens - 1
+                if num_accepted > num_draft_tokens:
+                    num_accepted = num_draft_tokens
                 num_rejected = num_draft_tokens - num_accepted
                 # num_computed_tokens represents the number of tokens
                 # processed in the current step, considering scheduled
@@ -1177,6 +1202,8 @@ class Scheduler(SchedulerInterface):
         return len(self.running), len(self.waiting)
 
     def add_request(self, request: Request) -> None:
+
+        logger.info("Prompt Group ID Trace: vllm/v1/core/sched/scheduler.py  Scheduler.add_request")
         self.waiting.add_request(request)
         self.requests[request.request_id] = request
         if self.log_stats:
