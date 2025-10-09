@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import json
 import os
 
 import numpy as np
@@ -33,7 +34,8 @@ class NgramProposer:
         self.valid_ngram_draft = np.zeros((max_num_seqs, self.k),
                                           dtype=np.int32)
         self.valid_ngram_num_drafts = np.zeros((max_num_seqs), dtype=np.int32)
-        # Track the longest context observed per prompt group.
+        # Track cached (previous round) and current-longest contexts per group.
+        self.group_cached_sequences = self._load_cached_sequences()
         self.group_longest_sequences: dict[int,
                                            tuple[str, np.ndarray]] = {}
 
@@ -64,6 +66,33 @@ class NgramProposer:
                      np.zeros((1024, self.max_model_len), dtype=np.int32),
                      set(), [])
 
+    def _load_cached_sequences(self) -> dict[int, np.ndarray]:
+        cache_path = "/home/yif034/ruige/Projects/vllm_SelfSpec/cache.json"
+        if not os.path.exists(cache_path):
+            return {}
+        try:
+            with open(cache_path, "r", encoding="utf-8") as cache_file:
+                data = json.load(cache_file)
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+        cached_sequences: dict[int, np.ndarray] = {}
+        for key, value in data.items():
+            if not isinstance(key, str) or not key.startswith("Prompt_"):
+                continue
+            try:
+                group_id = int(key.split("_", 1)[1])
+            except (ValueError, IndexError):
+                continue
+            if not isinstance(value, list):
+                continue
+            if value:
+                tokens = np.array(value, dtype=np.int32)
+            else:
+                tokens = np.empty(0, dtype=np.int32)
+            cached_sequences[group_id] = tokens
+        return cached_sequences
+
     def _update_group_longest_sequences(self, req_ids: list[str],
                                         prompt_group_ids: list[int],
                                         num_tokens_no_spec: np.ndarray,
@@ -74,11 +103,10 @@ class NgramProposer:
             seq_len = int(num_tokens_no_spec[idx])
             if seq_len <= 0:
                 continue
-            tokens = token_ids_cpu[idx, :seq_len]
+            tokens = np.array(token_ids_cpu[idx, :seq_len], dtype=np.int32)
             cached = self.group_longest_sequences.get(gid)
             if cached is None or seq_len > cached[1].shape[0]:
-                self.group_longest_sequences[gid] = (
-                    req_ids[idx], tokens.copy())
+                self.group_longest_sequences[gid] = (req_ids[idx], tokens)
 
     def _prepare_group_context_data(
         self,
@@ -87,7 +115,7 @@ class NgramProposer:
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         num_requests = len(prompt_group_ids)
         group_slot_ids = np.full(num_requests, -1, dtype=np.int32)
-        should_concat = np.zeros(num_requests, dtype=np.bool_)
+        should_concat = np.ones(num_requests, dtype=np.bool_)
         if not prompt_group_ids:
             empty_int = np.empty(0, dtype=np.int32)
             empty_bool = np.empty(0, dtype=np.bool_)
@@ -97,45 +125,59 @@ class NgramProposer:
         unique_group_ids: list[int] = []
         seen_groups: set[int] = set()
         for gid in prompt_group_ids:
-            if gid is None:   # ← new
-                continue
-            if gid in seen_groups:
+            if gid is None or gid in seen_groups:
                 continue
             seen_groups.add(gid)
             unique_group_ids.append(gid)
 
         group_slot_map: dict[int, int] = {}
-        offsets: list[int] = []
+        combined_segments: list[np.ndarray] = []
         lengths: list[int] = []
-        context_segments: list[np.ndarray] = []
-        total_length = 0
         for slot, gid in enumerate(unique_group_ids):
             group_slot_map[gid] = slot
-            entry = self.group_longest_sequences.get(gid)
-            tokens = (entry[1] if entry is not None else
-                      np.empty(0, dtype=np.int32))
-            tokens = np.asarray(tokens, dtype=np.int32)
-            offsets.append(total_length)
-            length = int(tokens.shape[0])
-            lengths.append(length)
-            if length > 0:
-                context_segments.append(tokens)
-            total_length += length
+            cached_tokens = self.group_cached_sequences.get(gid)
+            if cached_tokens is None:
+                cached_tokens = np.empty(0, dtype=np.int32)
+            cached_tokens = np.asarray(cached_tokens, dtype=np.int32)
 
-        if total_length > 0 and context_segments:
-            group_context_tokens = np.empty(total_length, dtype=np.int32)
+            entry = self.group_longest_sequences.get(gid)
+            current_tokens = (entry[1] if entry is not None else
+                              np.empty(0, dtype=np.int32))
+            current_tokens = np.asarray(current_tokens, dtype=np.int32)
+
+            if cached_tokens.size == 0 and current_tokens.size == 0:
+                combined = np.empty(0, dtype=np.int32)
+            elif cached_tokens.size == 0:
+                combined = current_tokens
+            elif current_tokens.size == 0:
+                combined = cached_tokens
+            else:
+                combined = np.empty(cached_tokens.size + current_tokens.size,
+                                    dtype=np.int32)
+                combined[:cached_tokens.size] = cached_tokens
+                combined[cached_tokens.size:] = current_tokens
+
+            combined_segments.append(combined)
+            lengths.append(int(combined.shape[0]))
+
+        total_length = sum(lengths)
+        if combined_segments:
+            group_context_offsets = np.empty(len(combined_segments),
+                                             dtype=np.int32)
+            group_context_tokens = (np.empty(total_length, dtype=np.int32)
+                                    if total_length > 0 else
+                                    np.empty(0, dtype=np.int32))
             cursor = 0
-            for segment in context_segments:
-                seg_len = segment.shape[0]
-                if seg_len == 0:
-                    continue
-                group_context_tokens[cursor:cursor + seg_len] = segment
+            for idx, segment in enumerate(combined_segments):
+                group_context_offsets[idx] = cursor
+                seg_len = lengths[idx]
+                if seg_len > 0:
+                    group_context_tokens[cursor:cursor + seg_len] = segment
                 cursor += seg_len
         else:
             group_context_tokens = np.empty(0, dtype=np.int32)
+            group_context_offsets = np.empty(0, dtype=np.int32)
 
-        group_context_offsets = (np.array(offsets, dtype=np.int32)
-                                 if offsets else np.empty(0, dtype=np.int32))
         group_context_lengths = (np.array(lengths, dtype=np.int32)
                                  if lengths else np.empty(0, dtype=np.int32))
 
@@ -148,8 +190,10 @@ class NgramProposer:
             if entry is None:
                 continue
             owner_req_id, tokens = entry
-            if tokens.shape[0] > 0 and owner_req_id != req_ids[idx]:
-                should_concat[idx] = True
+            # if (owner_req_id == req_ids[idx] and tokens.shape[0] > 0
+            #         and slot < group_context_lengths.shape[0]
+            #         and group_context_lengths[slot] > 0):
+            #     should_concat[idx] = False
 
         return (group_slot_ids, group_context_tokens, group_context_offsets,
                 group_context_lengths, should_concat)
@@ -214,7 +258,7 @@ class NgramProposer:
                 group_context_tokens = np.empty(0, dtype=np.int32)
                 group_context_offsets = np.empty(0, dtype=np.int32)
                 group_context_lengths = np.empty(0, dtype=np.int32)
-                should_concat = np.zeros(num_requests, dtype=np.bool_)
+                should_concat = np.ones(num_requests, dtype=np.bool_)
 
             batch_propose_numba(valid_ngram_requests, num_tokens_no_spec,
                                 token_ids_cpu, self.min_n, self.max_n,
@@ -373,7 +417,7 @@ def _find_longest_matched_ngram_and_propose_tokens(origin_tokens: np.ndarray,
         return np.empty((0, ), dtype=origin_tokens.dtype)
 
     # Do not generate draft tokens beyond the max model length.
-    k = min(k, max_model_len - total_token)
+    # k = min(k, max_model_len - total_token)                             # modified here temporarily
     if k <= 0:
         return np.empty((0, ), dtype=origin_tokens.dtype)
 

@@ -515,7 +515,7 @@ def rejection_random_sample_kernel(
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
             if NO_DRAFT_PROBS:
-                draft_prob = 1
+                draft_prob = 1.0
             else:
                 draft_prob = tl.load(draft_probs_ptr +
                                      (start_idx + pos) * vocab_size +

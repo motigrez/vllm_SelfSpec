@@ -33,9 +33,8 @@ def main():
         max_num_seqs=256,
         speculative_config={
             "method": "ngram",
-            "num_speculative_tokens": 8,
-            "prompt_lookup_max": 8,
-            "prompt_lookup_min": 4,
+            "num_speculative_tokens": 4,
+            "prompt_lookup_max": 6,
         },
         compilation_config={  # 新增部分
             "cudagraph_capture_sizes": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 576, 640, 768, 1024]
